@@ -17,17 +17,56 @@ OUTPUT_FILE = CLEAN_DIR / "cleaned_articles.json"
 
 def clean_text(text: str) -> str:
     """
-    清洗条文正文：
+    清洗普通文本：
     1. 去掉多余空白
-    2. 去掉换行、制表符
-    3. 保留中文标点和原始法律表述
+    2. 去掉网页残留字段
+    3. 去掉中文之间不必要的空格
     """
     if not text:
         return ""
 
     text = text.replace("\u3000", " ")
     text = re.sub(r"\s+", " ", text)
+
+    # 去掉北大法宝网页残留信息
+    # 例如：新旧对照 本条变迁 编辑精选 法宝新AI
+    garbage_patterns = [
+        r"新旧对照.*$",
+        r"本条变迁.*$",
+        r"编辑精选.*$",
+        r"法宝新AI.*$",
+    ]
+
+    for pattern in garbage_patterns:
+        text = re.sub(pattern, "", text)
+
+    # 去掉中文之间多余空格，例如 “根据 宪法” -> “根据宪法”
+    text = re.sub(r"(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])", "", text)
+
     return text.strip()
+
+
+def clean_article_content(content: str, article_no: str) -> str:
+    """
+    专门清洗条文正文：
+    1. 先进行基础清洗
+    2. 去掉正文开头重复的条号
+       例如：“第一条 为了保护……” -> “为了保护……”
+    """
+    content = clean_text(content)
+
+    if article_no:
+        article_no = clean_text(article_no)
+
+        # 去掉开头重复条号
+        # 支持：
+        # 第一条 为了……
+        # 第一条　为了……
+        # 第一条为了……
+        pattern = r"^" + re.escape(article_no) + r"\s*"
+        content = re.sub(pattern, "", content).strip()
+
+    return content
 
 
 def build_article_id(file_stem: str, index: int) -> str:
@@ -48,8 +87,8 @@ def normalize_one_file(file_path: Path) -> list:
     with open(file_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
-    law_name = raw_data.get("title", "").strip()
-    source_url = raw_data.get("url", "").strip()
+    law_name = clean_text(raw_data.get("title", ""))
+    source_url = clean_text(raw_data.get("url", ""))
     items = raw_data.get("items", [])
 
     file_stem = file_path.stem
@@ -62,7 +101,7 @@ def normalize_one_file(file_path: Path) -> list:
             continue
 
         article_no = clean_text(item.get("article_no", ""))
-        content = clean_text(item.get("content", ""))
+        content = clean_article_content(item.get("content", ""), article_no)
         chapter = clean_text(item.get("parent", ""))
 
         if not article_no or not content:
