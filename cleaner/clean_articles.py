@@ -5,36 +5,33 @@ from pathlib import Path
 
 RAW_DIR = Path("data/raw")
 CLEAN_DIR = Path("data/clean")
-
-INPUT_FILES = [
-    "civil_code.json",
-    "labor_contract_law.json",
-    "labor_law.json",
-]
-
 OUTPUT_FILE = CLEAN_DIR / "cleaned_articles.json"
 
 
 def clean_text(text: str) -> str:
     """
-    清洗普通文本：
-    1. 去掉多余空白
-    2. 去掉网页残留字段
+    基础文本清洗：
+    1. 去掉多余空白、换行、制表符
+    2. 去掉北大法宝网页残留信息
     3. 去掉中文之间不必要的空格
+    4. 去掉标点前多余空格
     """
     if not text:
         return ""
 
+    text = str(text)
+
+    # 统一空白
     text = text.replace("\u3000", " ")
     text = re.sub(r"\s+", " ", text)
 
     # 去掉北大法宝网页残留信息
-    # 例如：新旧对照 本条变迁 编辑精选 法宝新AI
     garbage_patterns = [
         r"新旧对照.*$",
         r"本条变迁.*$",
         r"编辑精选.*$",
         r"法宝新AI.*$",
+        r"法宝联想.*$",
     ]
 
     for pattern in garbage_patterns:
@@ -43,26 +40,24 @@ def clean_text(text: str) -> str:
     # 去掉中文之间多余空格，例如 “根据 宪法” -> “根据宪法”
     text = re.sub(r"(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])", "", text)
 
+    # 去掉标点前多余空格，例如 “宪法 ，” -> “宪法，”
+    text = re.sub(r"\s+([，。；：、！？,.!?])", r"\1", text)
+
     return text.strip()
 
 
 def clean_article_content(content: str, article_no: str) -> str:
     """
-    专门清洗条文正文：
-    1. 先进行基础清洗
+    条文正文清洗：
+    1. 基础清洗
     2. 去掉正文开头重复的条号
-       例如：“第一条 为了保护……” -> “为了保护……”
+       例如：
+       “第一条 为了保护……” -> “为了保护……”
     """
     content = clean_text(content)
+    article_no = clean_text(article_no)
 
     if article_no:
-        article_no = clean_text(article_no)
-
-        # 去掉开头重复条号
-        # 支持：
-        # 第一条 为了……
-        # 第一条　为了……
-        # 第一条为了……
         pattern = r"^" + re.escape(article_no) + r"\s*"
         content = re.sub(pattern, "", content).strip()
 
@@ -75,14 +70,14 @@ def build_article_id(file_stem: str, index: int) -> str:
     例如：
     civil_code_0001
     labor_contract_law_0001
-    labor_law_0001
+    criminal_law_0001
     """
     return f"{file_stem}_{index:04d}"
 
 
 def normalize_one_file(file_path: Path) -> list:
     """
-    将单个原始法律 JSON 转成统一条文格式。
+    将单个 raw 法律 JSON 转成统一条文格式。
     """
     with open(file_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
@@ -93,7 +88,6 @@ def normalize_one_file(file_path: Path) -> list:
 
     file_stem = file_path.stem
     cleaned_articles = []
-
     article_index = 1
 
     for item in items:
@@ -128,22 +122,27 @@ def main():
 
     all_articles = []
 
-    for file_name in INPUT_FILES:
-        file_path = RAW_DIR / file_name
+    raw_files = sorted(RAW_DIR.glob("*.json"))
 
-        if not file_path.exists():
-            print(f"[跳过] 文件不存在：{file_path}")
-            continue
+    if not raw_files:
+        print(f"[错误] 未找到 raw JSON 文件：{RAW_DIR}")
+        return
 
-        articles = normalize_one_file(file_path)
-        all_articles.extend(articles)
+    print(f"发现 raw 法律文件数量：{len(raw_files)}\n")
 
-        print(f"[完成] {file_name}：清洗出 {len(articles)} 条")
+    for file_path in raw_files:
+        try:
+            articles = normalize_one_file(file_path)
+            all_articles.extend(articles)
+            print(f"[完成] {file_path.name}：清洗出 {len(articles)} 条")
+        except Exception as e:
+            print(f"[失败] {file_path.name}：{e}")
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(all_articles, f, ensure_ascii=False, indent=2)
 
-    print(f"\n总计清洗条文数：{len(all_articles)}")
+    print("\n全部清洗完成")
+    print(f"总计清洗条文数：{len(all_articles)}")
     print(f"输出文件：{OUTPUT_FILE}")
 
 
