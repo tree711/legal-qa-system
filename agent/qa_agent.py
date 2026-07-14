@@ -51,13 +51,23 @@ class QAAgent:
 if __name__ == "__main__":
     agent = QAAgent("http://172.20.10.2:8000")
 
-    question = "劳动合同到期后公司不续签，需要赔偿吗？"
-    result = agent.answer(question)
+    while True:
+        question = input("\n请输入法律问题，输入 q 退出：").strip()
 
-    print("调用是否成功：", result["success"])
-    print("问题：", result["question"])
-    print("回答：", result["answer"])
-    print("引用法条：", result["references"])
+        if question.lower() == "q":
+            print("已退出 QAAgent 测试。")
+            break
 
-    if not result["success"]:
-        print("错误信息：", result["error"])
+        if not question:
+            print("问题不能为空，请重新输入。")
+            continue
+
+        result = agent.answer(question)
+
+        print("\n调用是否成功：", result["success"])
+        print("问题：", result["question"])
+        print("回答：", result["answer"])
+        print("引用法条：", result["references"])
+
+        if not result["success"]:
+            print("错误信息：", result["error"])
