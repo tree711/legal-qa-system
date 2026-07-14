@@ -39,13 +39,30 @@ except ImportError:
     print("[错误] 没有安装 faiss-cpu 库，请先运行：pip install faiss-cpu")
     sys.exit(1)
 
-from config import (
-    EMBED_MODEL,
-    FAISS_INDEX_PATH,
-    METADATA_PATH,
-    DEFAULT_TOP_K,
-    QUERY_PREFIX,
-)
+try:
+    # 被 api/main.py 以 `from embedding.search import ...` 方式导入时走这里
+    from embedding.config import (
+        EMBED_MODEL,
+        FAISS_INDEX_PATH,
+        METADATA_PATH,
+        DEFAULT_TOP_K,
+        QUERY_PREFIX,
+    )
+except ImportError:
+    # 直接运行 `python embedding/search.py` 时走这里
+    from config import (
+        EMBED_MODEL,
+        FAISS_INDEX_PATH,
+        METADATA_PATH,
+        DEFAULT_TOP_K,
+        QUERY_PREFIX,
+    )
+
+
+class IndexNotReadyError(RuntimeError):
+    """索引文件还没构建好时抛出。CLI 模式下会被 main() 捕获并友好提示；
+    被 api/main.py 当模块导入调用时，会被接口捕获并转成 HTTP 503 返回。"""
+    pass
 
 
 class LegalSearcher:
@@ -68,10 +85,9 @@ class LegalSearcher:
     def _check_index_ready():
         missing = [p for p in (FAISS_INDEX_PATH, METADATA_PATH) if not os.path.exists(p)]
         if missing:
-            print("[错误] 找不到索引文件，请先运行 build_index.py 构建索引：")
-            for p in missing:
-                print(f"    缺失: {p}")
-            sys.exit(1)
+            lines = ["找不到索引文件，请先运行 build_index.py 构建索引："]
+            lines += [f"    缺失: {p}" for p in missing]
+            raise IndexNotReadyError("\n".join(lines))
 
     def embed_query(self, query: str) -> np.ndarray:
         """把用户问题转成向量，并做归一化（要和 build_index.py 里的处理方式保持一致）"""
@@ -81,9 +97,9 @@ class LegalSearcher:
         try:
             response = ollama.embeddings(model=EMBED_MODEL, prompt=query)
         except Exception as e:
-            print("[错误] 调用 Ollama 生成向量失败，请确认 Ollama 服务已启动。")
-            print(f"原始错误: {e}")
-            sys.exit(1)
+            raise RuntimeError(
+                f"调用 {EMBED_MODEL} 生成向量失败，请确认 Ollama 服务已启动。原始错误: {e}"
+            ) from e
 
         vector = np.array([response["embedding"]], dtype="float32")
         faiss.normalize_L2(vector)
@@ -145,17 +161,29 @@ def interactive_mode(searcher: LegalSearcher):
             print("已退出。")
             break
 
-        results = searcher.search(query)
+        try:
+            results = searcher.search(query)
+        except RuntimeError as e:
+            print(f"[错误] {e}")
+            continue
         print_results(query, results)
 
 
 def main():
-    searcher = LegalSearcher()
+    try:
+        searcher = LegalSearcher()
+    except IndexNotReadyError as e:
+        print(f"[错误] {e}")
+        sys.exit(1)
 
     if len(sys.argv) > 1:
         # 命令行单次查询模式：python search.py "问题内容"
         query = " ".join(sys.argv[1:])
-        results = searcher.search(query)
+        try:
+            results = searcher.search(query)
+        except RuntimeError as e:
+            print(f"[错误] {e}")
+            sys.exit(1)
         print_results(query, results)
     else:
         interactive_mode(searcher)

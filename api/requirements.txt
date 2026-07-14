@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+ollama
+faiss-cpu
+numpy
