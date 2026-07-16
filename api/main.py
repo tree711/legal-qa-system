@@ -27,6 +27,7 @@ api/main.py
 
 import time
 import logging
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,10 +37,16 @@ import ollama
 
 try:
     # 通过 `uvicorn api.main:app` 以包的方式导入时走这里
-    from api.config import CHAT_MODEL, OLLAMA_HOST, GENERATE_TIMEOUT, HOST, PORT
+    from api.config import (
+        CHAT_MODEL, OLLAMA_HOST, GENERATE_TIMEOUT, HOST, PORT,
+        MAX_TOKENS, MAX_HISTORY_TURNS, KEEP_ALIVE,
+    )
 except ImportError:
     # 通过 `python api/main.py` 直接运行脚本时走这里
-    from config import CHAT_MODEL, OLLAMA_HOST, GENERATE_TIMEOUT, HOST, PORT
+    from config import (
+        CHAT_MODEL, OLLAMA_HOST, GENERATE_TIMEOUT, HOST, PORT,
+        MAX_TOKENS, MAX_HISTORY_TURNS, KEEP_ALIVE,
+    )
 
 try:
     # 复用 embedding 模块已经写好的检索能力，今天不用重新造轮子。
@@ -58,10 +65,34 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("legal-qa-api")
 
+API_DESCRIPTION = """
+给同组同学调用的法律问答接口，封装了本地 Ollama 大模型（qwen2:7b）和 FAISS 法律条文检索。
+
+## 快速上手
+1. 确认你和组长（服务提供方）在**同一个局域网/WiFi**下
+2. 用组长电脑的**局域网 IP**访问（不是 `localhost`，也不是 `127.0.0.1`——那两个都指向你自己的电脑）
+   例如：`http://192.168.x.x:8000/docs`
+3. 点开任意接口 → `Try it out` → 里面已经填好了示例请求 → `Execute` 就能看到真实返回结果
+
+## 接口怎么选
+| 你要做的事 | 用哪个接口 |
+|---|---|
+| 只想拿相关法条，不需要大模型生成回答 | `/search` |
+| 拿到法条 + 大模型生成的一次性回答 | `/rag` |
+| 需要多轮对话、记得上下文 | `/chat` |
+| 纯粹调用大模型、不做法条检索 | `/generate` |
+
+## 几个通用规则
+- 所有接口都是 POST，请求体是 JSON
+- `references` / `results` 里的 `score` 是余弦相似度（0~1），越接近 1 越相关
+- `low_confidence: true` 表示检索到的法条相关度都偏低，回答可能没有可靠法律依据支撑，前端建议做警示提示
+- 常见报错：`503` = 索引没建好或 Ollama 没启动；`502` = 调用 Ollama 失败；`422` = 请求 JSON 格式不对（多半是少了逗号或字段类型错了）
+"""
+
 app = FastAPI(
     title="法律问答系统 API",
-    description="给同组同学调用的问答接口，封装了本地 Ollama 大模型",
-    version="0.1.0",
+    description=API_DESCRIPTION,
+    version="0.2.0",
 )
 
 # 开发阶段先允许所有来源跨域访问，方便同学用不同工具（浏览器/前端页面/Postman）调试。
@@ -87,6 +118,12 @@ class GenerateRequest(BaseModel):
         description="可选，系统提示词（比如后面做 RAG 时把检索到的法条塞进这里）",
     )
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {"prompt": "试用期最长可以约定多久？"}
+        }
+    }
+
 
 class GenerateResponse(BaseModel):
     answer: str
@@ -97,6 +134,12 @@ class GenerateResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="用户输入的法律问题")
     top_k: int = Field(default=3, ge=1, le=20, description="返回最相关的几条法条，默认3条")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"query": "试用期最长可以约定多久？", "top_k": 3}
+        }
+    }
 
 
 class ArticleResult(BaseModel):
@@ -117,6 +160,12 @@ class RagRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="用户输入的法律问题")
     top_k: int = Field(default=3, ge=1, le=20, description="检索并参考的法条数量，默认3条")
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {"prompt": "试用期最长可以约定多久？", "top_k": 3}
+        }
+    }
+
 
 class RagResponse(BaseModel):
     answer: str
@@ -128,37 +177,73 @@ class RagResponse(BaseModel):
     )
 
 
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(..., min_length=1)
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "完整的历史对话消息列表，最后一条必须是 role=user 的新问题。"
+            "第一次提问时只传一条 user 消息即可；之后每次调用，"
+            "把上一次返回的 messages 原样传回来、并在最后追加新的 user 消息。"
+        ),
+    )
+    top_k: int = Field(default=3, ge=1, le=20, description="每轮检索并参考的法条数量")
+    use_rag: bool = Field(
+        default=True,
+        description="是否结合法条检索回答（默认开启）。关闭后就是纯闲聊模式，不查法条。",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "messages": [
+                    {"role": "user", "content": "试用期最长可以约定多久？"}
+                ],
+                "top_k": 3,
+                "use_rag": True,
+            }
+        }
+    }
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    messages: list[ChatMessage] = Field(description="更新后的完整对话历史（包含这一轮的回答），下一轮原样传回来即可")
+    references: list[ArticleResult] = Field(description="这一轮检索到的法条，use_rag=False 时为空列表")
+    model: str
+    elapsed_seconds: float
+    low_confidence: bool = Field(
+        description="use_rag=True 且检索到的法条相关度都偏低时为 True"
+    )
+
+
 # ========== 核心函数 ==========
 
-def generate_answer(prompt: str, system_prompt: str | None = None) -> str:
+def _call_ollama_chat(messages: list[dict]) -> str:
     """
-    调用本地 qwen2:7b 生成回答。
+    实际调用 Ollama chat 接口的底层函数，接收完整的 messages 列表
+    （可以是单轮的 [system?, user]，也可以是多轮历史 [system?, user, assistant, user, ...]）。
 
-    这是 api/main.py 的核心函数，今天从 Mock 换成了真实调用。
-    第2周做 RAG 时，直接把检索到的法条内容拼进 system_prompt 或者 prompt 里传进来即可，
-    这个函数本身不用改。
-
-    参数：
-        prompt: 用户的问题
-        system_prompt: 系统提示词（可选）。RAG 场景下通常是：
-            "你是一个法律助手，请根据以下法律条文回答问题：\n{检索到的条文}"
-
-    返回：
-        模型生成的回答文本
+    generate_answer()（单轮）和 /chat 接口（多轮对话）都复用这个函数，
+    避免重复写一遍调用逻辑和错误处理。
 
     异常：
         调用失败时抛出 RuntimeError，由上层接口转换成 HTTP 错误返回给调用方。
     """
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
     try:
         response = _client.chat(
             model=CHAT_MODEL,
             messages=messages,
-            options={"num_ctx": 2048},  # 显存有限（4GB显卡），先调小一点，够用再说
+            options={
+                "num_ctx": 2048,       # 显存有限（4GB显卡），先调小一点，够用再说
+                "num_predict": MAX_TOKENS,  # 限制单次生成长度，避免回答过长拖慢速度
+            },
+            keep_alive=KEEP_ALIVE,  # 联调期间让模型常驻显存，避免反复加载卸载
         )
     except Exception as e:
         logger.exception("调用 Ollama 生成回答失败")
@@ -173,6 +258,28 @@ def generate_answer(prompt: str, system_prompt: str | None = None) -> str:
     return answer
 
 
+def generate_answer(prompt: str, system_prompt: str | None = None) -> str:
+    """
+    调用本地 qwen2:7b 生成回答（单轮，没有历史上下文）。
+
+    这是 /generate 和 /rag 接口用的核心函数。
+    多轮对话场景（带历史消息）用的是下面 /chat 接口里直接调用的 _call_ollama_chat()。
+
+    参数：
+        prompt: 用户的问题
+        system_prompt: 系统提示词（可选）。RAG 场景下通常是：
+            "你是一个法律助手，请根据以下法律条文回答问题：\n{检索到的条文}"
+
+    返回：
+        模型生成的回答文本
+    """
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return _call_ollama_chat(messages)
+
+
 # ========== RAG 相关 ==========
 
 # 相关度阈值：top1 分数低于这个值，说明检索到的法条大概率文不对题，
@@ -180,6 +287,8 @@ def generate_answer(prompt: str, system_prompt: str | None = None) -> str:
 # 这个值是根据实测调整的：无关问题（比如问天气）top1 大概 0.47，
 # 正常法律问题 top1 基本在 0.73 以上，中间留了不少余量，先定在 0.6。
 RELEVANCE_THRESHOLD = 0.6
+
+
 
 
 def build_rag_system_prompt(articles: list) -> str:
@@ -206,7 +315,7 @@ def build_rag_system_prompt(articles: list) -> str:
 
 # ========== 接口路由 ==========
 
-@app.get("/health")
+@app.get("/health", tags=["系统状态"], summary="健康检查")
 def health():
     """
     健康检查接口。
@@ -216,7 +325,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/generate", response_model=GenerateResponse)
+@app.post("/generate", response_model=GenerateResponse, tags=["对话生成"], summary="纯生成（不检索法条）")
 def generate(req: GenerateRequest):
     """
     对话生成接口。同学可以直接 POST 一个问题过来，拿到大模型的回答。
@@ -235,7 +344,7 @@ def generate(req: GenerateRequest):
     return GenerateResponse(answer=answer, model=CHAT_MODEL, elapsed_seconds=elapsed)
 
 
-@app.post("/search", response_model=SearchResponse)
+@app.post("/search", response_model=SearchResponse, tags=["法条检索"], summary="纯检索，返回 top_k 条法条")
 def search_articles(req: SearchRequest):
     """
     检索接口。输入一个法律问题，返回最相关的 top_k 条法条（不经过大模型，纯检索）。
@@ -251,7 +360,7 @@ def search_articles(req: SearchRequest):
     return SearchResponse(query=req.query, results=results)
 
 
-@app.post("/rag", response_model=RagResponse)
+@app.post("/rag", response_model=RagResponse, tags=["法条检索"], summary="检索 + 生成 + 引用（单轮）")
 def rag(req: RagRequest):
     """
     完整 RAG 接口：检索相关法条 → 拼进 prompt → 调用大模型生成回答 → 返回答案和引用的法条。
@@ -283,6 +392,77 @@ def rag(req: RagRequest):
 
     return RagResponse(
         answer=answer,
+        references=articles,
+        model=CHAT_MODEL,
+        elapsed_seconds=elapsed,
+        low_confidence=low_confidence,
+    )
+
+
+@app.post("/chat", response_model=ChatResponse, tags=["多轮对话"], summary="多轮对话（带上下文历史）")
+def chat(req: ChatRequest):
+    """
+    多轮对话接口：接收完整的历史消息列表，返回带上下文的回答。
+
+    用法约定：
+    - 第一次提问：messages = [{"role": "user", "content": "问题1"}]
+    - 拿到返回后，把返回的 messages 原样保存下来
+    - 下一轮提问：把上一轮返回的 messages 追加一条新的 user 消息再传进来
+      即 messages = 上一轮返回的 messages + [{"role": "user", "content": "问题2"}]
+
+    每一轮都会用"最新这条用户消息"重新检索一次法条（如果 use_rag=True），
+    保证多轮对话中每次回答依据的都是当前问题最相关的法条，而不是第一轮检索的旧结果。
+    """
+    if req.messages[-1].role != "user":
+        raise HTTPException(status_code=400, detail="messages 的最后一条必须是 role=user 的新问题")
+
+    start = time.time()
+    latest_query = req.messages[-1].content
+
+    articles = []
+    system_prompt = None
+    if req.use_rag:
+        try:
+            articles = retrieve_articles(latest_query, top_k=req.top_k)
+        except IndexNotReadyError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        system_prompt = build_rag_system_prompt(articles)
+
+    # 历史消息里可能已经带了旧的 system 消息（比如上一轮的检索结果），
+    # 这里统一过滤掉，换成这一轮最新检索到的，避免新旧法条信息互相打架
+    history_without_system = [m for m in req.messages if m.role != "system"]
+
+    # 只保留最近 MAX_HISTORY_TURNS 轮（一问一答算一轮 = 2 条消息），
+    # 避免对话轮数一多，每轮都要重新处理越来越长的历史，导致越聊越慢。
+    # 注意：这里只是"这次发给模型看多少"，接口最终返回的 messages 仍是完整历史。
+    max_messages = MAX_HISTORY_TURNS * 2
+    if len(history_without_system) > max_messages:
+        history_without_system = history_without_system[-max_messages:]
+
+    ollama_messages = []
+    if system_prompt:
+        ollama_messages.append({"role": "system", "content": system_prompt})
+    ollama_messages += [{"role": m.role, "content": m.content} for m in history_without_system]
+
+    try:
+        answer = _call_ollama_chat(ollama_messages)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    updated_messages = req.messages + [ChatMessage(role="assistant", content=answer)]
+    low_confidence = req.use_rag and ((not articles) or articles[0]["score"] < RELEVANCE_THRESHOLD)
+    elapsed = time.time() - start
+
+    logger.info(
+        f"/chat 完成，用时 {elapsed:.2f}s，历史长度 {len(req.messages)}，"
+        f"最新提问: {latest_query[:30]}..."
+    )
+
+    return ChatResponse(
+        answer=answer,
+        messages=updated_messages,
         references=articles,
         model=CHAT_MODEL,
         elapsed_seconds=elapsed,
