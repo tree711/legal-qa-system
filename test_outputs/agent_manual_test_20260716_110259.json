@@ -1,0 +1,24 @@
+[
+  {
+    "index": 1,
+    "category": "劳动法",
+    "question": "劳动合同试用期最长可以约定多久？",
+    "retrieval_result": {
+      "agent": "RetrievalAgent",
+      "status": "error",
+      "question": "劳动合同试用期最长可以约定多久？",
+      "results": [],
+      "trusted_results": [],
+      "reference_results": [],
+      "message": "调用 /search 接口超时。"
+    },
+    "summary_result": {
+      "agent": "SummaryAgent",
+      "status": "error",
+      "question": "劳动合同试用期最长可以约定多久？",
+      "summary": "",
+      "references": [],
+      "message": "调用 /search 接口超时。"
+    }
+  }
+]

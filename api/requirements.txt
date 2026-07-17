@@ -4,3 +4,4 @@ pydantic
 ollama
 faiss-cpu
 numpy
+requests
