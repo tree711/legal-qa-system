@@ -133,11 +133,11 @@ class GenerateResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="用户输入的法律问题")
-    top_k: int = Field(default=3, ge=1, le=20, description="返回最相关的几条法条，默认3条")
+    top_k: int = Field(default=5, ge=1, le=20, description="返回最相关的几条法条，默认5条")
 
     model_config = {
         "json_schema_extra": {
-            "example": {"query": "试用期最长可以约定多久？", "top_k": 3}
+            "example": {"query": "试用期最长可以约定多久？", "top_k": 5}
         }
     }
 
@@ -158,11 +158,11 @@ class SearchResponse(BaseModel):
 
 class RagRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="用户输入的法律问题")
-    top_k: int = Field(default=3, ge=1, le=20, description="检索并参考的法条数量，默认3条")
+    top_k: int = Field(default=5, ge=1, le=20, description="检索并参考的法条数量，默认5条")
 
     model_config = {
         "json_schema_extra": {
-            "example": {"prompt": "试用期最长可以约定多久？", "top_k": 3}
+            "example": {"prompt": "试用期最长可以约定多久？", "top_k": 5}
         }
     }
 
@@ -192,7 +192,7 @@ class ChatRequest(BaseModel):
             "把上一次返回的 messages 原样传回来、并在最后追加新的 user 消息。"
         ),
     )
-    top_k: int = Field(default=3, ge=1, le=20, description="每轮检索并参考的法条数量")
+    top_k: int = Field(default=5, ge=1, le=20, description="每轮检索并参考的法条数量，默认5条")
     use_rag: bool = Field(
         default=True,
         description="是否结合法条检索回答（默认开启）。关闭后就是纯闲聊模式，不查法条。",
@@ -204,7 +204,7 @@ class ChatRequest(BaseModel):
                 "messages": [
                     {"role": "user", "content": "试用期最长可以约定多久？"}
                 ],
-                "top_k": 3,
+                "top_k": 5,
                 "use_rag": True,
             }
         }
@@ -289,6 +289,20 @@ def generate_answer(prompt: str, system_prompt: str | None = None) -> str:
 RELEVANCE_THRESHOLD = 0.6
 
 
+def build_retrieval_query(messages: list) -> str:
+    """
+    多轮对话里，用户的追问经常是简短、依赖上文的（比如"那如果一直没签怎么办？"），
+    只拿这一句去检索，容易在语义上飘偏（比如"公司"两个字单独检索会匹配到不相关的公司法条款）。
+
+    这里做一个简单、低成本的改进：把上一轮用户提问也拼进检索文本里，帮检索抓住话题；
+    不改变喂给大模型生成回答用的完整对话历史，只影响"用什么去检索法条"这一步。
+    """
+    user_turns = [m.content for m in messages if m.role == "user"]
+    if len(user_turns) >= 2:
+        return f"{user_turns[-2]} {user_turns[-1]}"
+    return user_turns[-1] if user_turns else ""
+
+
 
 
 def build_rag_system_prompt(articles: list) -> str:
@@ -308,6 +322,12 @@ def build_rag_system_prompt(articles: list) -> str:
     return (
         "你是一个法律助手，请仅根据下面提供的法律条文回答用户的问题。\n"
         "如果条文里没有能回答问题的内容，请明确说明现有条文不足以回答，不要编造。\n"
+        "不要引用与问题无关的法律条文来凑内容，只使用真正相关的条文。\n"
+        "如果条文中包含按数值/期限分档的规则（例如按合同期限、金额、天数分为几档），"
+        "请先逐档核对用户问题里的具体数值落在哪一档，写出这个匹配过程，再给出结论，"
+        "不要跳过匹配直接下结论，也不要混用其他档位的规则。\n"
+        "如果问题是一个是非判断题（比如\"是否合法\"\"是否构成\"），"
+        "请明确给出\"是/否\"或\"合法/不合法\"的结论，不要只罗列可能性、回避明确判断。\n"
         "回答时请指出依据的是第几条法条（用 [编号] 标注）。\n\n"
         f"参考法条：\n{joined}"
     )
@@ -418,12 +438,15 @@ def chat(req: ChatRequest):
 
     start = time.time()
     latest_query = req.messages[-1].content
+    # 检索用的 query 额外拼上上一轮问题，帮助理解简短追问的真实意图；
+    # 传给大模型生成回答的 latest_query / 完整历史不受影响
+    retrieval_query = build_retrieval_query(req.messages)
 
     articles = []
     system_prompt = None
     if req.use_rag:
         try:
-            articles = retrieve_articles(latest_query, top_k=req.top_k)
+            articles = retrieve_articles(retrieval_query, top_k=req.top_k)
         except IndexNotReadyError as e:
             raise HTTPException(status_code=503, detail=str(e))
         except RuntimeError as e:
