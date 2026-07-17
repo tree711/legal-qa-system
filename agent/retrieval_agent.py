@@ -22,7 +22,7 @@ class RetrievalAgent:
 
     def __init__(
         self,
-        base_url: str = "http://172.20.10.2:8000",
+        base_url: str = "http://192.20.10.2:8000",
         score_threshold: float = 0.6,
         timeout: int = 30,
     ) -> None:
