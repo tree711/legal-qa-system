@@ -1,9 +1,26 @@
-__pycache__/
-*.pyc
-.env
+# Python
+.venv/
 venv/
-data/raw/
-data/cleaned/
-data/index/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local secrets and editor settings
+.env
+*.env.local
+.vscode/
+.idea/
+
+# Frontend generated files
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/*.backup.json
+npm-debug.log*
+
+# Operating-system files
 .DS_Store
-data/test/test_samples_part2_backup.json
+Thumbs.db
+
+# Raw crawl cache may be large; cleaned documents and FAISS indexes are retained.
+data/raw/

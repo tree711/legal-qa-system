@@ -1,0 +1,63 @@
+/* 法律文本阅读层：正文使用更温和的宋体体系，控件保留清晰的无衬线字体。 */
+:root {
+  font-family: "Noto Sans SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+}
+
+.content,
+.composer textarea,
+.reference h3,
+.reference p,
+.reference > strong,
+.summary p {
+  font-family: "Noto Serif SC", "Source Han Serif SC", "思源宋体", "Songti SC", "STSong", SimSun, serif;
+}
+
+.content { font-size: 15px; line-height: 1.9; padding: 15px 17px; letter-spacing: .015em; }
+.role span { font-size: 12px; }
+.role small { font-size: 8px; }
+.composer textarea { font-size: 14px; line-height: 1.7; }
+
+.inspector { padding: 17px 15px; }
+.inspector-head h2 { font-size: 20px; }
+.inspector-head span { font-size: 9px; }
+.secure { font-size: 10px; }
+.warning b { font-size: 12px; }
+.warning span { font-size: 11px; line-height: 1.55; }
+.meta span { font-size: 9px; }
+.meta b { font-size: 11px; }
+.panel-title { padding: 11px 12px; }
+.panel-title span,
+.panel-title em { font-size: 10px; }
+.panel-title b { font-size: 12px; }
+.reference { padding: 13px 12px; }
+.ref-head span,
+.ref-head em { font-size: 9px; }
+.reference h3 { font-size: 14px; line-height: 1.55; margin: 8px 0 4px; }
+.reference > strong { font-size: 12px; margin-bottom: 7px; }
+.reference p { font-size: 12px; line-height: 1.8; -webkit-line-clamp: 7; }
+.ref-actions button,
+.ref-actions a { font-size: 11px; }
+.timeline li { padding: 7px 0; }
+.timeline li i { width: 18px; height: 18px; font-size: 9px; }
+.timeline li span { font-size: 11px; line-height: 1.65; }
+.summary b { font-size: 11px; }
+.summary p { font-size: 11px; line-height: 1.75; }
+.empty b { font-size: 12px; }
+.empty span { font-size: 10px; }
+
+/* “法条证据检索”页面的结果卡片。 */
+.reference.large { padding: 17px 17px 15px 50px; }
+.reference.large h3 { font-size: 16px; line-height: 1.55; }
+.reference.large > strong { font-size: 13px; }
+.reference.large p { font-size: 14px; line-height: 1.85; }
+.reference.large .ref-head span,
+.reference.large .ref-head em { font-size: 11px; }
+.reference.large .result-rank { font-size: 18px; }
+.reference.large .ref-actions button,
+.reference.large .ref-actions a { font-size: 12px; }
+
+@media (max-width: 680px) {
+  .content { font-size: 14px; padding: 13px 14px; }
+  .reference p { font-size: 11px; }
+  .reference.large p { font-size: 13px; }
+}
