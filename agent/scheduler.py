@@ -22,19 +22,20 @@ class AgentScheduler:
        RetrievalAgent -> QAAgent.chat(/chat) -> SummaryAgent
     """
 
-    def __init__(self, base_url: str = "http://172.20.10.2:8000", top_k: int = 3):
+    def __init__(
+        self, base_url: str = "http://172.20.10.2:8000", top_k: int = 3,
+        search_handler=None, rag_handler=None, chat_handler=None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.top_k = top_k
 
         self.retrieval_agent = RetrievalAgent(
-            base_url=self.base_url,
-            timeout=120
+            base_url=self.base_url, timeout=120, search_handler=search_handler
         )
 
         self.qa_agent = QAAgent(
-            base_url=self.base_url,
-            top_k=self.top_k,
-            timeout=120
+            base_url=self.base_url, top_k=self.top_k, timeout=120,
+            rag_handler=rag_handler, chat_handler=chat_handler,
         )
 
         self.summary_agent = SummaryAgent()
@@ -143,9 +144,9 @@ class AgentScheduler:
             "raw": qa_result.get("raw", {})
         }
 
-    def chat(self, messages: list[dict]) -> dict:
+    def chat(self, messages: list[dict], search_query: str | None = None) -> dict:
         """
-        多轮 Agent 调度流程。
+        统一 Agent 调度流程（首轮和多轮共用）。
 
         在原有三 Agent 串联基础上新增多轮对话支持：
         1. 接收 messages 历史
@@ -188,7 +189,7 @@ class AgentScheduler:
                 "error": "messages 中必须至少包含一条 user 消息。"
             }
 
-        search_query = self._build_search_query_from_messages(messages)
+        search_query = (search_query or self._build_search_query_from_messages(messages)).strip()
 
         steps.append("接收用户多轮对话历史")
         steps.append("提取当前问题及最近上下文")
@@ -219,7 +220,9 @@ class AgentScheduler:
         steps.append("调用 QAAgent，通过 /chat 生成最终回答")
 
         try:
-            qa_result = self.qa_agent.chat(messages)
+            qa_result = self.qa_agent.chat(
+                messages, search_query=search_query, retrieval_result=retrieval_result
+            )
         except Exception as exc:
             qa_result = {
                 "success": False,
@@ -346,17 +349,10 @@ if __name__ == "__main__":
     print("\n========== 单轮调度测试 ==========")
 
     test_questions = [
-    "劳动合同试用期最长可以约定多久？",
-    "劳动合同期限不满三个月，可以约定试用期吗？",
-    "用人单位违法延长试用期需要承担什么责任？",
-    "借款合同一定要采用书面形式吗？",
-    "未成年人签订的合同是否有效？",
-    "盗窃他人财物可能承担什么法律责任？",
-    "股东是否有权查阅公司会计账簿？",
-    "商家规定商品一经售出概不退换是否合法？",
-    "公司这样做合法吗？",
-    "今天天气怎么样？",
-]
+        "法律对劳动者每日和平均每周的标准工作时间如何规定？",
+        "用人单位应当在用工后多长时间内与劳动者订立书面劳动合同？",
+        "不同劳动合同期限对应的试用期上限分别是多少？",
+    ]
 
     for question in test_questions:
         print("\n" + "=" * 60)

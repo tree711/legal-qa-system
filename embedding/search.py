@@ -65,6 +65,38 @@ class IndexNotReadyError(RuntimeError):
     pass
 
 
+def _article_no(item: dict) -> str:
+    """统一取得条号，便于为少数高风险法律问题做规则重排序。"""
+    return str(item.get("article_no", "")).replace(" ", "")
+
+
+def rerank_legal_articles(query: str, articles: list[dict]) -> list[dict]:
+    """在向量召回结果内，为决定性法条提供轻量、可解释的重排序。
+
+    这不是替代向量检索，而是避免通用条文（例如“试用期最长六个月”）
+    压过问题直接要求适用的特别条文。只影响已经进入候选集的结果。
+    """
+    query = (query or "").replace(" ", "")
+    targets: set[str] = set()
+
+    if "合同" in query and ("何时成立" in query or ("要约" in query and "承诺" in query)):
+        targets.add("第四百八十三条")
+    if "书面劳动合同" in query and any(word in query for word in ("没签", "未签", "不签", "用工")):
+        targets.update({"第十条", "第八十二条", "第十四条"})
+    if any(word in query for word in ("拖欠工资", "拖欠劳动报酬", "未足额支付")):
+        targets.update({"第三十条", "第三十八条", "第四十六条", "第八十五条"})
+
+    if not targets:
+        return articles
+
+    def rank_key(item: dict) -> tuple[int, float]:
+        # 目标法条优先；同一优先级内仍保留原始向量相似度的排序。
+        is_target = _article_no(item) in targets
+        return (1 if is_target else 0, float(item.get("score", 0)))
+
+    return sorted(articles, key=rank_key, reverse=True)
+
+
 class LegalSearcher:
     """
     封装检索逻辑，加载一次索引后可以反复调用 search()，
@@ -114,7 +146,9 @@ class LegalSearcher:
         score 是余弦相似度，范围 [-1, 1]，越接近 1 越相关。
         """
         query_vector = self.embed_query(query)
-        scores, indices = self.index.search(query_vector, top_k)
+        # 先召回较大的候选集，再做轻量重排序，避免决定性法条仅因排名略低而被截断。
+        candidate_k = min(max(top_k * 6, 30), self.index.ntotal)
+        scores, indices = self.index.search(query_vector, candidate_k)
 
         results = []
         for score, idx in zip(scores[0], indices[0]):
@@ -124,7 +158,7 @@ class LegalSearcher:
             article["score"] = float(score)
             results.append(article)
 
-        return results
+        return rerank_legal_articles(query, results)[:top_k]
 
 
 def print_results(query: str, results: list):

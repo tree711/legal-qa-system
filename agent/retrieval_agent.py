@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -25,15 +25,24 @@ class RetrievalAgent:
         base_url: str = "http://192.20.10.2:8000",
         score_threshold: float = 0.6,
         timeout: int = 30,
+        search_handler: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.search_url = f"{base_url.rstrip('/')}/search"
         self.score_threshold = score_threshold
         self.timeout = timeout
+        self.search_handler = search_handler
 
     def retrieve(self, question: str) -> dict[str, Any]:
         question = (question or "").strip()
         if not question:
             return self._error_result("", "问题不能为空。")
+
+        if self.search_handler is not None:
+            try:
+                data = self.search_handler(question)
+            except Exception as exc:
+                return self._error_result(question, f"本地检索调用失败：{exc}")
+            return self._normalize_response(question, data)
 
         try:
             response = requests.post(
@@ -62,6 +71,9 @@ class RetrievalAgent:
         except ValueError:
             return self._error_result(question, "接口返回内容不是合法 JSON。")
 
+        return self._normalize_response(question, data)
+
+    def _normalize_response(self, question: str, data: dict[str, Any]) -> dict[str, Any]:
         raw_results = data.get("results", [])
         if not isinstance(raw_results, list):
             return self._error_result(question, "接口字段 results 不是列表。")

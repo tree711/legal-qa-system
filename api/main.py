@@ -27,6 +27,8 @@ api/main.py
 
 import time
 import logging
+import json
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -61,6 +63,21 @@ except ImportError:
     if _project_root not in _sys.path:
         _sys.path.insert(0, _project_root)
     from embedding.search import search as retrieve_articles, IndexNotReadyError
+
+
+try:
+    from agent.scheduler import AgentScheduler
+except ImportError:
+    from scheduler import AgentScheduler
+
+try:
+    from services.session_store import (
+        create_session, list_sessions, get_session, save_messages, clear_session, delete_session
+    )
+except ImportError:
+    from session_store import (
+        create_session, list_sessions, get_session, save_messages, clear_session, delete_session
+    )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("legal-qa-api")
@@ -133,11 +150,11 @@ class GenerateResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="用户输入的法律问题")
-    top_k: int = Field(default=5, ge=1, le=20, description="返回最相关的几条法条，默认5条")
+    top_k: int = Field(default=3, ge=1, le=20, description="返回最相关的几条法条，默认3条")
 
     model_config = {
         "json_schema_extra": {
-            "example": {"query": "试用期最长可以约定多久？", "top_k": 5}
+            "example": {"query": "试用期最长可以约定多久？", "top_k": 3}
         }
     }
 
@@ -158,11 +175,11 @@ class SearchResponse(BaseModel):
 
 class RagRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="用户输入的法律问题")
-    top_k: int = Field(default=5, ge=1, le=20, description="检索并参考的法条数量，默认5条")
+    top_k: int = Field(default=3, ge=1, le=20, description="检索并参考的法条数量，默认3条")
 
     model_config = {
         "json_schema_extra": {
-            "example": {"prompt": "试用期最长可以约定多久？", "top_k": 5}
+            "example": {"prompt": "试用期最长可以约定多久？", "top_k": 3}
         }
     }
 
@@ -183,20 +200,14 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(
-        ...,
-        min_length=1,
-        description=(
-            "完整的历史对话消息列表，最后一条必须是 role=user 的新问题。"
-            "第一次提问时只传一条 user 消息即可；之后每次调用，"
-            "把上一次返回的 messages 原样传回来、并在最后追加新的 user 消息。"
-        ),
+    messages: list[ChatMessage] | None = Field(
+        default=None,
+        description="兼容旧模式：传完整历史消息，最后一条必须为 user。",
     )
-    top_k: int = Field(default=5, ge=1, le=20, description="每轮检索并参考的法条数量，默认5条")
-    use_rag: bool = Field(
-        default=True,
-        description="是否结合法条检索回答（默认开启）。关闭后就是纯闲聊模式，不查法条。",
-    )
+    session_id: str | None = Field(default=None, description="服务器会话 ID；与 message 配合使用")
+    message: str | None = Field(default=None, min_length=1, description="服务器会话模式下的新问题")
+    top_k: int = Field(default=3, ge=1, le=20, description="每轮检索并参考的法条数量")
+    use_rag: bool = Field(default=True, description="是否结合法条检索回答")
 
     model_config = {
         "json_schema_extra": {
@@ -204,7 +215,7 @@ class ChatRequest(BaseModel):
                 "messages": [
                     {"role": "user", "content": "试用期最长可以约定多久？"}
                 ],
-                "top_k": 5,
+                "top_k": 3,
                 "use_rag": True,
             }
         }
@@ -213,6 +224,8 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+    session_id: str | None = None
+    rewritten_question: str | None = None
     messages: list[ChatMessage] = Field(description="更新后的完整对话历史（包含这一轮的回答），下一轮原样传回来即可")
     references: list[ArticleResult] = Field(description="这一轮检索到的法条，use_rag=False 时为空列表")
     model: str
@@ -220,6 +233,9 @@ class ChatResponse(BaseModel):
     low_confidence: bool = Field(
         description="use_rag=True 且检索到的法条相关度都偏低时为 True"
     )
+    steps: list[str] = Field(default_factory=list, description="三个 Agent 的实际调度步骤")
+    summary_result: dict = Field(default_factory=dict, description="SummaryAgent 的结构化总结")
+    retrieval_result: dict = Field(default_factory=dict, description="RetrievalAgent 的标准化结果")
 
 
 # ========== 核心函数 ==========
@@ -240,8 +256,11 @@ def _call_ollama_chat(messages: list[dict]) -> str:
             model=CHAT_MODEL,
             messages=messages,
             options={
-                "num_ctx": 2048,       # 显存有限（4GB显卡），先调小一点，够用再说
-                "num_predict": MAX_TOKENS,  # 限制单次生成长度，避免回答过长拖慢速度
+                "num_ctx": 2048,
+                "num_predict": MAX_TOKENS,
+                # 法律结论应尽量稳定，避免同一问题多次调用出现相反结论。
+                "temperature": 0,
+                "seed": 42,
             },
             keep_alive=KEEP_ALIVE,  # 联调期间让模型常驻显存，避免反复加载卸载
         )
@@ -289,20 +308,18 @@ def generate_answer(prompt: str, system_prompt: str | None = None) -> str:
 RELEVANCE_THRESHOLD = 0.6
 
 
-def build_retrieval_query(messages: list) -> str:
-    """
-    多轮对话里，用户的追问经常是简短、依赖上文的（比如"那如果一直没签怎么办？"），
-    只拿这一句去检索，容易在语义上飘偏（比如"公司"两个字单独检索会匹配到不相关的公司法条款）。
-
-    这里做一个简单、低成本的改进：把上一轮用户提问也拼进检索文本里，帮检索抓住话题；
-    不改变喂给大模型生成回答用的完整对话历史，只影响"用什么去检索法条"这一步。
-    """
-    user_turns = [m.content for m in messages if m.role == "user"]
-    if len(user_turns) >= 2:
-        return f"{user_turns[-2]} {user_turns[-1]}"
-    return user_turns[-1] if user_turns else ""
 
 
+def _extract_hard_rules(articles: list) -> list[str]:
+    """提取检索条文中的强制性表述，供生成阶段作反例约束。"""
+    rules = []
+    for index, article in enumerate(articles, start=1):
+        content = str(article.get("content", ""))
+        for sentence in content.replace("；", "。 ").split("。"):
+            sentence = sentence.strip()
+            if sentence and any(word in sentence for word in ("只能", "不得", "必须", "应当")):
+                rules.append(f"[{index}] {sentence}")
+    return rules[:8]
 
 
 def build_rag_system_prompt(articles: list) -> str:
@@ -319,17 +336,216 @@ def build_rag_system_prompt(articles: list) -> str:
         law_texts.append(f"[{i}] {title}\n{a.get('content', '')}")
 
     joined = "\n\n".join(law_texts)
+    hard_rules = _extract_hard_rules(articles)
+    hard_rules_text = "\n".join(f"- {rule}" for rule in hard_rules) or "- 无"
     return (
-        "你是一个法律助手，请仅根据下面提供的法律条文回答用户的问题。\n"
-        "如果条文里没有能回答问题的内容，请明确说明现有条文不足以回答，不要编造。\n"
-        "不要引用与问题无关的法律条文来凑内容，只使用真正相关的条文。\n"
-        "如果条文中包含按数值/期限分档的规则（例如按合同期限、金额、天数分为几档），"
-        "请先逐档核对用户问题里的具体数值落在哪一档，写出这个匹配过程，再给出结论，"
-        "不要跳过匹配直接下结论，也不要混用其他档位的规则。\n"
-        "如果问题是一个是非判断题（比如\"是否合法\"\"是否构成\"），"
-        "请明确给出\"是/否\"或\"合法/不合法\"的结论，不要只罗列可能性、回避明确判断。\n"
-        "回答时请指出依据的是第几条法条（用 [编号] 标注）。\n\n"
+        "你是严谨的法律法规问答助手。你只能使用下面【参考法条】中的文字作答，"
+        "不得使用记忆补充法条、案例、法律链接或任何未提供的事实。\n"
+        "作答前必须逐项核对问题中的期限、主体、条件和例外；当一般规则与同一批参考法条中的"
+        "更具体规则同时出现时，应以能直接适用该事实的具体规则为准。\n"
+        "如果参考法条没有决定性依据，第一行必须写“结论：现有参考法条不足以确定”。"
+        "不得猜测、不得把不相干条文拼成结论。\n"
+        "若依据充分，严格按以下格式输出：\n"
+        "结论：用一句话直接回答。\n"
+        "依据：列出实际使用的 [编号] 及其法规名称、条号，并简述其如何支持结论。\n"
+        "说明：仅补充回答该问题必需的条件、例外或处理建议。\n"
+        "只能引用参考法条的 [编号]；不得输出 URL、Markdown 超链接、未提供的法条号，"
+        "也不得引用未实际用于结论的条文。\n\n"
+        "【反例约束（必须遵守）】\n"
+        "以下硬性规则直接适用时，结论不得与其相反，也不得自行增加法条未写明的条件、"
+        "例外或豁免。回答中的“通常、首次、例外、除非、可能”等限定语，必须能由同一批"
+        "参考法条逐字支持；否则删除该限定语并按硬性规则作答。\n"
+        f"{hard_rules_text}\n\n"
         f"参考法条：\n{joined}"
+    )
+
+
+
+
+def _normalize_chat_request(req: ChatRequest) -> tuple[list[ChatMessage], str | None]:
+    """兼容前端传完整 messages 与服务器 session_id + message 两种模式。"""
+    if req.session_id:
+        session = get_session(req.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        messages = [ChatMessage(**m) for m in session.get("messages", [])]
+        if req.message and req.message.strip():
+            messages.append(ChatMessage(role="user", content=req.message.strip()))
+        elif req.messages:
+            messages = req.messages
+        else:
+            raise HTTPException(status_code=400, detail="session_id 模式必须提供 message")
+        return messages, req.session_id
+
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="请提供 messages，或提供 session_id + message")
+    return req.messages, None
+
+
+def rewrite_question(messages: list[ChatMessage]) -> str:
+    """将依赖上下文的追问改写成可独立检索的问题；失败时退化为最近用户问题拼接。"""
+    latest = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    previous = [m for m in messages[:-1] if m.role in {"user", "assistant"}][-4:]
+    if not previous:
+        return latest
+    context = "\n".join(f"{m.role}: {m.content}" for m in previous)
+    prompt = (
+        "请把最后一个用户问题改写成一个无需上下文也能理解、适合检索法律条文的完整问题。"
+        "只输出改写后的问题，不要解释；不要增加对话中没有的事实。\n\n"
+        f"对话上下文：\n{context}\n\n最后问题：{latest}"
+    )
+    try:
+        rewritten = generate_answer(prompt).strip().strip('"“”')
+        if rewritten and len(rewritten) <= 300:
+            return rewritten
+    except Exception:
+        logger.warning("问题改写失败，使用规则兜底", exc_info=True)
+    recent_users = [m.content for m in messages if m.role == "user"][-3:]
+    return "；".join(recent_users)
+
+
+def _local_search_handler(query: str, top_k: int) -> dict:
+    """供 RetrievalAgent 在 API 进程内调用，避免再通过 HTTP 请求本机 /search。"""
+    results = retrieve_articles(query, top_k=top_k)
+    return {"query": query, "results": results}
+
+
+def _local_rag_handler(question: str, top_k: int) -> dict:
+    """供 QAAgent 单轮调用，逻辑与 /rag 一致，但不发 HTTP 请求。"""
+    start = time.time()
+    articles = retrieve_articles(question, top_k=top_k)
+    answer = generate_answer(question, build_rag_system_prompt(articles))
+    return {
+        "answer": answer,
+        "references": articles,
+        "model": CHAT_MODEL,
+        "elapsed_seconds": time.time() - start,
+        "low_confidence": (not articles) or articles[0]["score"] < RELEVANCE_THRESHOLD,
+    }
+
+
+def _local_multiturn_handler(
+    messages: list[dict], top_k: int, search_query: str | None,
+    retrieval_result: dict | None,
+) -> dict:
+    """供 QAAgent 多轮调用；复用 RetrievalAgent 已检索的结果，避免二次检索。"""
+    start = time.time()
+    articles = (retrieval_result or {}).get("results", [])
+    # RetrievalAgent 会补充 trusted 字段，返回前端前去除该内部字段。
+    references = [
+        {k: v for k, v in item.items() if k != "trusted"}
+        for item in articles
+    ]
+    system_prompt = build_rag_system_prompt(references)
+    history = [m for m in messages if m.get("role") != "system"][-MAX_HISTORY_TURNS * 2:]
+    ollama_messages = [{"role": "system", "content": system_prompt}] + history
+    answer = _call_ollama_chat(ollama_messages)
+    updated = messages + [{"role": "assistant", "content": answer}]
+    return {
+        "answer": answer,
+        "messages": updated,
+        "references": references,
+        "model": CHAT_MODEL,
+        "elapsed_seconds": time.time() - start,
+        "low_confidence": (not references) or references[0]["score"] < RELEVANCE_THRESHOLD,
+        "rewritten_question": search_query,
+    }
+
+
+def process_chat(req: ChatRequest) -> ChatResponse:
+    """/chat 的统一 Agent 入口：首轮与多轮都经过三个 Agent。"""
+    messages, session_id = _normalize_chat_request(req)
+    if messages[-1].role != "user":
+        raise HTTPException(status_code=400, detail="最后一条消息必须是 role=user 的新问题")
+
+    start = time.time()
+    message_dicts = [m.model_dump() for m in messages]
+    latest_query = messages[-1].content
+    user_turns = sum(1 for m in messages if m.role == "user")
+    rewritten_query = rewrite_question(messages) if user_turns > 1 and req.use_rag else latest_query
+
+    # 关闭 RAG 时不应仍然执行检索和 Agent 调度。此前 use_rag 仅影响问题改写，
+    # 前端开关与后端行为不一致；这里保留多轮上下文，但明确返回空引用。
+    if not req.use_rag:
+        history = [m.model_dump() for m in messages if m.role != "system"][-MAX_HISTORY_TURNS * 2:]
+        try:
+            answer = _call_ollama_chat([
+                {
+                    "role": "system",
+                    "content": "你是法律学习助手。请说明回答仅供学习参考；不确定时明确说明，不要编造法条或结论。",
+                },
+                *history,
+            ])
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        updated = messages + [ChatMessage(role="assistant", content=answer)]
+        if session_id:
+            title = next((m.content[:24] for m in updated if m.role == "user"), "新对话")
+            save_messages(session_id, [m.model_dump() for m in updated], title)
+        return ChatResponse(
+            answer=answer,
+            session_id=session_id,
+            rewritten_question=latest_query,
+            messages=updated,
+            references=[],
+            model=CHAT_MODEL,
+            elapsed_seconds=time.time() - start,
+            low_confidence=True,
+            steps=["接收用户对话历史", "RAG 已关闭，直接调用本地模型", "完成非检索问答"],
+            summary_result={},
+            retrieval_result={},
+        )
+
+    try:
+        scheduler = AgentScheduler(
+            base_url="http://127.0.0.1:8000",
+            top_k=req.top_k,
+            search_handler=lambda q: _local_search_handler(q, req.top_k),
+            rag_handler=_local_rag_handler,
+            chat_handler=_local_multiturn_handler,
+        )
+        # 首轮和多轮均走 chat 调度链路。这样 RetrievalAgent 的同一份结果会
+        # 同时供 QAAgent 生成答案、SummaryAgent 汇总和前端展示使用，避免首轮
+        # 先检索一次、/rag 再检索一次造成引用与答案不一致。
+        result = scheduler.chat(message_dicts, search_query=rewritten_query)
+    except IndexNotReadyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("error", "Agent 调度失败"))
+
+    raw = result.get("raw", {}) or {}
+    answer = result.get("final_answer", "")
+    references = [
+        {k: v for k, v in item.items() if k != "trusted"}
+        for item in result.get("references", [])
+    ]
+    updated_dicts = raw.get("messages") or (message_dicts + [{"role": "assistant", "content": answer}])
+    updated = [ChatMessage(**m) for m in updated_dicts]
+
+    if session_id:
+        title = next((m.content[:24] for m in updated if m.role == "user"), "新对话")
+        save_messages(session_id, [m.model_dump() for m in updated], title)
+
+    low_confidence = raw.get("low_confidence")
+    if low_confidence is None:
+        low_confidence = (not references) or references[0]["score"] < RELEVANCE_THRESHOLD
+
+    return ChatResponse(
+        answer=answer,
+        session_id=session_id,
+        rewritten_question=rewritten_query,
+        messages=updated,
+        references=references,
+        model=raw.get("model", CHAT_MODEL),
+        elapsed_seconds=raw.get("elapsed_seconds") or (time.time() - start),
+        low_confidence=bool(low_confidence),
+        steps=result.get("steps", []),
+        summary_result=result.get("summary_result", {}),
+        retrieval_result=result.get("retrieval_result", {}),
     )
 
 
@@ -342,7 +558,20 @@ def health():
     同学第一次连接时，先访问这个接口确认服务和网络是通的，
     不涉及调用大模型，所以响应很快，用来快速排查"服务没起来"还是"模型调用慢"。
     """
-    return {"status": "ok"}
+    checks = {"api": "ok", "ollama": "error", "model": "unknown", "faiss_index": "missing"}
+    try:
+        models = _client.list()
+        checks["ollama"] = "ok"
+        checks["model"] = "ok" if CHAT_MODEL in json.dumps(models, ensure_ascii=False) else "missing"
+    except Exception:
+        pass
+    try:
+        from embedding.config import FAISS_INDEX_PATH, METADATA_PATH
+        if Path(FAISS_INDEX_PATH).exists() and Path(METADATA_PATH).exists():
+            checks["faiss_index"] = "ok"
+    except Exception:
+        pass
+    return {"status": "ok" if checks["api"] == "ok" else "error", "checks": checks}
 
 
 @app.post("/generate", response_model=GenerateResponse, tags=["对话生成"], summary="纯生成（不检索法条）")
@@ -419,78 +648,70 @@ def rag(req: RagRequest):
     )
 
 
-@app.post("/chat", response_model=ChatResponse, tags=["多轮对话"], summary="多轮对话（带上下文历史）")
+@app.post("/chat", response_model=ChatResponse, tags=["Agent 对话"], summary="统一 Agent 入口（三 Agent + 多轮上下文）")
 def chat(req: ChatRequest):
-    """
-    多轮对话接口：接收完整的历史消息列表，返回带上下文的回答。
+    return process_chat(req)
 
-    用法约定：
-    - 第一次提问：messages = [{"role": "user", "content": "问题1"}]
-    - 拿到返回后，把返回的 messages 原样保存下来
-    - 下一轮提问：把上一轮返回的 messages 追加一条新的 user 消息再传进来
-      即 messages = 上一轮返回的 messages + [{"role": "user", "content": "问题2"}]
 
-    每一轮都会用"最新这条用户消息"重新检索一次法条（如果 use_rag=True），
-    保证多轮对话中每次回答依据的都是当前问题最相关的法条，而不是第一轮检索的旧结果。
-    """
-    if req.messages[-1].role != "user":
-        raise HTTPException(status_code=400, detail="messages 的最后一条必须是 role=user 的新问题")
+class SessionCreateRequest(BaseModel):
+    title: str = "新对话"
 
-    start = time.time()
-    latest_query = req.messages[-1].content
-    # 检索用的 query 额外拼上上一轮问题，帮助理解简短追问的真实意图；
-    # 传给大模型生成回答的 latest_query / 完整历史不受影响
-    retrieval_query = build_retrieval_query(req.messages)
 
-    articles = []
-    system_prompt = None
-    if req.use_rag:
-        try:
-            articles = retrieve_articles(retrieval_query, top_k=req.top_k)
-        except IndexNotReadyError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-        except RuntimeError as e:
-            raise HTTPException(status_code=502, detail=str(e))
-        system_prompt = build_rag_system_prompt(articles)
+@app.post("/sessions", tags=["会话管理"])
+def create_session_route(req: SessionCreateRequest):
+    return create_session(req.title)
 
-    # 历史消息里可能已经带了旧的 system 消息（比如上一轮的检索结果），
-    # 这里统一过滤掉，换成这一轮最新检索到的，避免新旧法条信息互相打架
-    history_without_system = [m for m in req.messages if m.role != "system"]
 
-    # 只保留最近 MAX_HISTORY_TURNS 轮（一问一答算一轮 = 2 条消息），
-    # 避免对话轮数一多，每轮都要重新处理越来越长的历史，导致越聊越慢。
-    # 注意：这里只是"这次发给模型看多少"，接口最终返回的 messages 仍是完整历史。
-    max_messages = MAX_HISTORY_TURNS * 2
-    if len(history_without_system) > max_messages:
-        history_without_system = history_without_system[-max_messages:]
+@app.get("/sessions", tags=["会话管理"])
+def list_sessions_route():
+    return {"sessions": list_sessions()}
 
-    ollama_messages = []
-    if system_prompt:
-        ollama_messages.append({"role": "system", "content": system_prompt})
-    ollama_messages += [{"role": m.role, "content": m.content} for m in history_without_system]
 
+@app.get("/sessions/{session_id}", tags=["会话管理"])
+def get_session_route(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return session
+
+
+@app.delete("/sessions/{session_id}", tags=["会话管理"])
+def delete_session_route(session_id: str):
+    if not delete_session(session_id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"success": True}
+
+
+@app.post("/sessions/{session_id}/clear", tags=["会话管理"])
+def clear_session_route(session_id: str):
+    session = clear_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return session
+
+
+@app.get("/stats", tags=["系统状态"])
+def stats():
+    from embedding.config import CLEANED_DATA_PATH, METADATA_PATH
+    law_count = article_count = 0
+    updated_at = None
     try:
-        answer = _call_ollama_chat(ollama_messages)
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    updated_messages = req.messages + [ChatMessage(role="assistant", content=answer)]
-    low_confidence = req.use_rag and ((not articles) or articles[0]["score"] < RELEVANCE_THRESHOLD)
-    elapsed = time.time() - start
-
-    logger.info(
-        f"/chat 完成，用时 {elapsed:.2f}s，历史长度 {len(req.messages)}，"
-        f"最新提问: {latest_query[:30]}..."
-    )
-
-    return ChatResponse(
-        answer=answer,
-        messages=updated_messages,
-        references=articles,
-        model=CHAT_MODEL,
-        elapsed_seconds=elapsed,
-        low_confidence=low_confidence,
-    )
+        data = json.loads(Path(CLEANED_DATA_PATH).read_text(encoding="utf-8"))
+        article_count = len(data)
+        law_count = len({x.get("law_name", "") for x in data if x.get("law_name")})
+    except Exception:
+        try:
+            meta = json.loads(Path(METADATA_PATH).read_text(encoding="utf-8"))
+            article_count = len(meta)
+            law_count = len({x.get("law_name", "") for x in meta if x.get("law_name")})
+        except Exception:
+            pass
+    try:
+        updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(Path(METADATA_PATH).stat().st_mtime))
+    except Exception:
+        pass
+    return {"law_count": law_count, "article_count": article_count, "index_updated_at": updated_at,
+            "model": CHAT_MODEL, "sessions": len(list_sessions())}
 
 
 if __name__ == "__main__":

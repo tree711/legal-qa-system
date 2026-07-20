@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import requests
+from typing import Callable, Any
 
 
 class QAAgent:
@@ -14,10 +15,16 @@ class QAAgent:
     2. chat(messages)：调用 /chat 接口，处理多轮对话
     """
 
-    def __init__(self, base_url: str, top_k: int = 3, timeout: int = 120):
+    def __init__(
+        self, base_url: str, top_k: int = 3, timeout: int = 120,
+        rag_handler: Callable[[str, int], dict[str, Any]] | None = None,
+        chat_handler: Callable[[list[dict], int, str | None, dict | None], dict[str, Any]] | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.top_k = top_k
         self.timeout = timeout
+        self.rag_handler = rag_handler
+        self.chat_handler = chat_handler
 
     def answer(self, question: str) -> dict:
         """
@@ -33,6 +40,13 @@ class QAAgent:
                 "references": [],
                 "error": "问题不能为空。"
             }
+
+        if self.rag_handler is not None:
+            try:
+                data = self.rag_handler(question, self.top_k)
+                return self._success_result(question, data)
+            except Exception as exc:
+                return {"success": False, "question": question, "answer": "", "references": [], "error": str(exc)}
 
         url = f"{self.base_url}/rag"
 
@@ -50,16 +64,7 @@ class QAAgent:
             response.raise_for_status()
             data = response.json()
 
-            return {
-                "success": True,
-                "question": question,
-                "answer": data.get("answer", ""),
-                "references": data.get("references", []),
-                "model": data.get("model", ""),
-                "elapsed_seconds": data.get("elapsed_seconds", None),
-                "low_confidence": data.get("low_confidence", None),
-                "raw": data
-            }
+            return self._success_result(question, data)
 
         except requests.exceptions.RequestException as e:
             return {
@@ -70,7 +75,10 @@ class QAAgent:
                 "error": str(e)
             }
 
-    def chat(self, messages: list[dict]) -> dict:
+    def chat(
+        self, messages: list[dict], search_query: str | None = None,
+        retrieval_result: dict | None = None,
+    ) -> dict:
         """
         多轮问答：调用 /chat。
 
@@ -105,6 +113,15 @@ class QAAgent:
                 "error": "messages 中必须至少包含一条 user 消息。"
             }
 
+        if self.chat_handler is not None:
+            try:
+                data = self.chat_handler(messages, self.top_k, search_query, retrieval_result)
+                result = self._success_result(current_question, data)
+                result["messages"] = data.get("messages", messages)
+                return result
+            except Exception as exc:
+                return {"success": False, "question": current_question, "messages": messages, "answer": "", "references": [], "error": str(exc)}
+
         url = f"{self.base_url}/chat"
 
         payload = {
@@ -121,17 +138,9 @@ class QAAgent:
             response.raise_for_status()
             data = response.json()
 
-            return {
-                "success": True,
-                "question": current_question,
-                "messages": messages,
-                "answer": data.get("answer", ""),
-                "references": data.get("references", []),
-                "model": data.get("model", ""),
-                "elapsed_seconds": data.get("elapsed_seconds", None),
-                "low_confidence": data.get("low_confidence", None),
-                "raw": data
-            }
+            result = self._success_result(current_question, data)
+            result["messages"] = data.get("messages", messages)
+            return result
 
         except requests.exceptions.RequestException as e:
             return {
@@ -142,6 +151,19 @@ class QAAgent:
                 "references": [],
                 "error": str(e)
             }
+
+    @staticmethod
+    def _success_result(question: str, data: dict) -> dict:
+        return {
+            "success": True,
+            "question": question,
+            "answer": data.get("answer", ""),
+            "references": data.get("references", []),
+            "model": data.get("model", ""),
+            "elapsed_seconds": data.get("elapsed_seconds"),
+            "low_confidence": data.get("low_confidence"),
+            "raw": data,
+        }
 
     @staticmethod
     def _normalize_messages(messages: list[dict]) -> list[dict]:
