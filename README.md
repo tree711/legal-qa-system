@@ -529,11 +529,14 @@ data/test/chat_regression_results_v3.json
 
 ### 3. 100 条测试数据集
 
+项目保留两组完整的 100 条测试结果，用于比较基础 RAG 流程与完整 Agent 流程：
+
 ```text
-data/test/test_samples_full_agent_result.json
+data/test/test_samples_full.json               # 基础 RAG 测试结果
+data/test/test_samples_full_agent_result.json  # 完整 Agent 调度测试结果
 ```
 
-数据集包含 100 条法律问答样本，主要字段包括：
+两组数据使用相同的问题范围和统一字段，可以分别复核检索与生成效果，并观察引入 Agent 调度后的结果变化。主要字段包括：
 
 ```json
 {
