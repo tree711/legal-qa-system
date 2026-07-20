@@ -6,3 +6,4 @@ data/raw/
 data/cleaned/
 data/index/
 .DS_Store
+data/test/test_samples_part2_backup.json
